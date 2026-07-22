@@ -1,205 +1,250 @@
 import streamlit as st
-import sys
-import os
-import time
-import subprocess
+import cv2
+import av
+import numpy as np
 
-# -------------------------------------------------------------
-# MAIN DASHBOARD UI CONFIG
-# -------------------------------------------------------------
-st.set_page_config(page_title="Sign Language AI", layout="wide")
+from streamlit_webrtc import (
+    webrtc_streamer,
+    VideoProcessorBase,
+    WebRtcMode,
+)
 
-# -------------------------------------------------------------
-# PREMIUM CUSTOM CSS
-# -------------------------------------------------------------
-st.markdown("""
-<style>
-    /* Global Font & Background Styling */
-    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap');
-    
-    html, body, [class*="css"] {
-        font-family: 'Outfit', sans-serif;
-    }
-    
-    /* Animated Gradient Title */
-    .premium-title {
-        font-size: 4rem;
-        font-weight: 800;
-        background: linear-gradient(300deg, #00b4db, #0083b0, #ff8a00, #e52e71);
-        background-size: 300% 300%;
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        animation: gradient-animation 8s ease infinite;
-        text-align: center;
-        margin-bottom: 0px;
-        padding-bottom: 0px;
-    }
-    
-    @keyframes gradient-animation {
-        0% { background-position: 0% 50%; }
-        50% { background-position: 100% 50%; }
-        100% { background-position: 0% 50%; }
-    }
-    
-    /* Subtitle styling */
-    .premium-subtitle {
-        text-align: center;
-        color: #888;
-        font-size: 1.2rem;
-        margin-top: -10px;
-        margin-bottom: 40px;
-        font-weight: 300;
-    }
+from prediction.predictor import Predictor
+from utils.mediapipe_utils import HandDetector
+from utils.preprocessing import Preprocessor
 
-    /* Glassmorphism Cards */
-    .glass-card {
-        background: rgba(255, 255, 255, 0.05);
-        backdrop-filter: blur(10px);
-        -webkit-backdrop-filter: blur(10px);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 15px;
-        padding: 25px;
-        transition: transform 0.3s ease, box-shadow 0.3s ease;
-    }
-    
-    .glass-card:hover {
-        transform: translateY(-5px);
-        box-shadow: 0 10px 30px rgba(0, 180, 219, 0.2);
-        border: 1px solid rgba(0, 180, 219, 0.4);
-    }
-    
-    /* Pulsing Status Indicator */
-    .status-indicator {
-        display: inline-block;
-        width: 12px;
-        height: 12px;
-        background-color: #00ff88;
-        border-radius: 50%;
-        margin-right: 8px;
-        box-shadow: 0 0 10px #00ff88;
-        animation: pulse 2s infinite;
-    }
-    
-    @keyframes pulse {
-        0% { box-shadow: 0 0 0 0 rgba(0, 255, 136, 0.7); }
-        70% { box-shadow: 0 0 0 10px rgba(0, 255, 136, 0); }
-        100% { box-shadow: 0 0 0 0 rgba(0, 255, 136, 0); }
-    }
 
-    /* Custom Launch Button Styling */
-    div.stButton > button:first-child {
-        background: linear-gradient(90deg, #ff8a00, #e52e71);
-        color: white;
-        font-size: 1.5rem;
-        font-weight: 600;
-        padding: 1rem 3rem;
-        border: none;
-        border-radius: 50px;
-        box-shadow: 0 4px 15px rgba(229, 46, 113, 0.4);
-        transition: all 0.3s ease;
-        width: 100%;
-    }
-    
-    div.stButton > button:first-child:hover {
-        transform: scale(1.02);
-        box-shadow: 0 8px 25px rgba(229, 46, 113, 0.6);
-        background: linear-gradient(90deg, #e52e71, #ff8a00);
-    }
-    
-    div.stButton > button:first-child:active {
-        transform: scale(0.98);
-    }
-</style>
-""", unsafe_allow_html=True)
+# ==========================================================
+# PAGE CONFIG
+# ==========================================================
 
-# -------------------------------------------------------------
-# DASHBOARD CONTENT
-# -------------------------------------------------------------
-st.markdown('<div class="premium-title">AI Sign Language Translator</div>', unsafe_allow_html=True)
-st.markdown('<div class="premium-subtitle">Real-Time Neural Network Inference Engine</div>', unsafe_allow_html=True)
+st.set_page_config(
+    page_title="AI Sign Language Translator",
+    page_icon="🤟",
+    layout="wide",
+)
 
-# Main Grid Layout
-col1, col2, col3 = st.columns([1, 2, 1])
+# ==========================================================
+# TITLE
+# ==========================================================
+
+st.title("🤟 AI Sign Language Translator")
+
+st.markdown(
+    """
+    Real-Time Sign Language Recognition using **MediaPipe + TensorFlow + CNN**
+    """
+)
+
+st.markdown("---")
+
+
+# ==========================================================
+# LOAD MODEL
+# ==========================================================
+
+@st.cache_resource
+def load_predictor():
+    return Predictor()
+
+
+predictor = load_predictor()
+
+print("Model Ready:", predictor.is_ready())
+
+
+# ==========================================================
+# LOAD MEDIAPIPE
+# ==========================================================
+
+detector = HandDetector(max_num_hands=1)
+
+preprocessor = Preprocessor()
+
+
+# ==========================================================
+# SESSION STATE
+# ==========================================================
+
+if "sentence" not in st.session_state:
+    st.session_state.sentence = ""
+
+if "prediction" not in st.session_state:
+    st.session_state.prediction = ""
+
+if "confidence" not in st.session_state:
+    st.session_state.confidence = 0.0
+    # ==========================================================
+# VIDEO PROCESSOR
+# ==========================================================
+
+class SignProcessor(VideoProcessorBase):
+
+    def __init__(self):
+        self.current_label = "-"
+        self.current_confidence = 0.0
+
+    def recv(self, frame):
+
+        try:
+            # Browser frame -> OpenCV image
+            image = frame.to_ndarray(format="bgr24")
+
+            # Mirror image
+            image = cv2.flip(image, 1)
+
+            # Convert BGR -> RGB
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+            # Detect hand
+            processed_image, results = detector.process_frame(rgb)
+
+            print("Frame received")
+
+            # Convert RGB -> BGR for display
+            display_image = cv2.cvtColor(
+                processed_image,
+                cv2.COLOR_RGB2BGR
+            )
+
+            # Reset prediction
+            self.current_label = "-"
+            self.current_confidence = 0.0
+
+            # If hand detected
+            if results.multi_hand_landmarks:
+
+                print("Hand detected")
+
+                hand_landmarks = results.multi_hand_landmarks[0]
+
+                # Crop hand
+                cropped_hand = preprocessor.crop_and_resize(
+                    rgb,
+                    hand_landmarks
+                )
+
+                if cropped_hand is not None:
+
+                    print("Crop successful")
+
+                    cropped_hand = cropped_hand.astype(np.float32)
+                    cropped_hand /= 255.0
+
+                    if predictor.is_ready():
+
+                        print("Model loaded")
+
+                        label, confidence = predictor.predict(
+                            cropped_hand
+                        )
+
+                        print(
+                            "Prediction:",
+                            label,
+                            confidence
+                        )
+
+                        self.current_label = label
+                        self.current_confidence = confidence
+
+                        # Draw prediction
+                        cv2.putText(
+                            display_image,
+                            f"Letter : {label}",
+                            (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            1,
+                            (0, 255, 0),
+                            2
+                        )
+
+                        cv2.putText(
+                            display_image,
+                            f"Confidence : {confidence*100:.2f}%",
+                            (20, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8,
+                            (255, 255, 0),
+                            2
+                        )
+
+            return av.VideoFrame.from_ndarray(
+                display_image,
+                format="bgr24"
+            )
+
+        except Exception as e:
+
+            print("ERROR:", e)
+
+            return av.VideoFrame.from_ndarray(
+                image,
+                format="bgr24"
+            )
+        # ==========================================================
+# START WEBCAM
+# ==========================================================
+
+st.markdown("---")
+st.subheader("📷 Live Camera")
+
+ctx = webrtc_streamer(
+    key="sign-language-camera",
+    mode=WebRtcMode.SENDRECV,
+    video_processor_factory=SignProcessor,
+    media_stream_constraints={
+        "video": True,
+        "audio": False,
+    },
+    rtc_configuration={
+        "iceServers": [
+            {"urls": ["stun:stun.l.google.com:19302"]}
+        ]
+    },
+    async_processing=True,
+)
+
+st.markdown("---")
+
+
+# ==========================================================
+# DASHBOARD
+# ==========================================================
+
+col1, col2 = st.columns([3, 1])
 
 with col2:
-    # Glassmorphism Control Center
-    st.markdown("""
-        <div class="glass-card">
-            <h3 style="margin-top: 0; color: #fff;">
-                <span class="status-indicator"></span>System Status: Online
-            </h3>
-            <p style="color: #bbb; font-size: 1rem;">
-                The deep learning vision system is loaded and ready. Ensure your webcam is unobstructed before launching.
-            </p>
-        </div>
-        <br>
-    """, unsafe_allow_html=True)
-    
-    # Launch Button
-    start_clicked = st.button("🚀 LAUNCH VISION SYSTEM")
-    
-    if start_clicked:
-        with st.spinner("Initializing Deep Neural Network..."):
-            time.sleep(0.8) # Micro-interaction delay for premium feel
-            
-        st.toast("System successfully launched!", icon="✅")
-        st.balloons()
-        
-        try:
-            # Launch main.py in a separate process
-            script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")
-            subprocess.Popen([sys.executable, script_path], shell=False)
-            
-            st.markdown("""
-                <div style="background-color: rgba(0,255,136,0.1); border-left: 4px solid #00ff88; padding: 15px; border-radius: 0 10px 10px 0; margin-top: 20px;">
-                    <strong style="color: #00ff88;">✓ Connection Established</strong><br>
-                    <span style="color: #ddd;">The native Python vision terminal is running on your desktop.</span>
-                </div>
-            """, unsafe_allow_html=True)
-        except Exception as e:
-            st.error(f"An error occurred while launching the app: {e}")
 
-st.markdown("<br><br>", unsafe_allow_html=True)
+    st.subheader("📊 Prediction")
 
-# Interactive Information Section
-st.markdown("---")
-info_col1, info_col2, info_col3 = st.columns(3)
+    if ctx.video_processor is not None:
 
-with info_col1:
-    st.markdown("""
-        <div class="glass-card" style="text-align: center;">
-            <h1 style="color: #00b4db; margin: 0; font-size: 3rem;">98%</h1>
-            <p style="color: #888; font-weight: 600;">Model Accuracy</p>
-        </div>
-    """, unsafe_allow_html=True)
+        st.metric(
+            "Current Letter",
+            ctx.video_processor.current_label
+        )
 
-with info_col2:
-    st.markdown("""
-        <div class="glass-card" style="text-align: center;">
-            <h1 style="color: #ff8a00; margin: 0; font-size: 3rem;"><15ms</h1>
-            <p style="color: #888; font-weight: 600;">Inference Latency</p>
-        </div>
-    """, unsafe_allow_html=True)
+        st.metric(
+            "Confidence",
+            f"{ctx.video_processor.current_confidence*100:.2f}%"
+        )
 
-with info_col3:
-    st.markdown("""
-        <div class="glass-card" style="text-align: center;">
-            <h1 style="color: #e52e71; margin: 0; font-size: 3rem;">2+</h1>
-            <p style="color: #888; font-weight: 600;">Neural Layers</p>
-        </div>
-    """, unsafe_allow_html=True)
+    else:
 
-st.markdown("<br>", unsafe_allow_html=True)
+        st.metric("Current Letter", "-")
+        st.metric("Confidence", "0.00%")
 
-with st.expander("🛠️ How to use the Vision Terminal"):
-    st.markdown("""
-    Once the native window opens, ensure you are in a well-lit area. Use the following keyboard controls inside the OpenCV terminal window:
-    
-    * **`P`** - Toggle AI Prediction Mode on/off
-    * **`D`** - Collect custom hand gesture data
-    * **`T`** - Train the Neural Network on your custom data
-    * **`S`** - Speak the current sentence aloud using TTS
-    * **`C`** - Clear the current sentence
-    * **`Space`** - Add a space to the sentence
-    * **`Q`** - Safely quit the application
-    """)
+
+with col1:
+
+    st.subheader("📝 Sentence")
+
+    sentence_box = st.empty()
+
+    sentence_box.text_area(
+        "Detected Text",
+        value=st.session_state.sentence,
+        height=150,
+        disabled=True
+    )

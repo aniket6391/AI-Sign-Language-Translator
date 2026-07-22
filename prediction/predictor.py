@@ -1,4 +1,5 @@
 import os
+import sys
 import numpy as np
 import tensorflow as tf
 
@@ -6,18 +7,36 @@ class Predictor:
     """
     Utility class to load the trained CNN model and make real-time predictions.
     """
-    def __init__(self, model_path="models/cnn_model.keras", labels_path="models/labels.txt"):
+    def __init__(self):
         self.model = None
         self.classes = []
-        
+
+        # Get correct path
+        if getattr(sys, "frozen", False):
+            base_path = os.path.dirname(sys.executable)
+        else:
+            base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+        model_path = os.path.join(base_path, "models", "cnn_model.keras")
+        labels_path = os.path.join(base_path, "models", "labels.txt")
+
+        print("Model Path:", model_path)
+        print("Labels Path:", labels_path)
+
         # Load Model
         if os.path.exists(model_path):
             self.model = tf.keras.models.load_model(model_path)
-            
+            print("✅ Model Loaded")
+        else:
+            print("❌ Model Not Found")
+
         # Load Labels
         if os.path.exists(labels_path):
             with open(labels_path, "r") as f:
                 self.classes = f.read().strip().split("\n")
+            print("✅ Labels Loaded")
+        else:
+            print("❌ Labels Not Found")
 
     def is_ready(self):
         """Checks if both model and labels are successfully loaded."""
